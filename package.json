@@ -1,0 +1,12 @@
+{
+  "name": "klinik-randevu-sunucu",
+  "version": "1.0.0",
+  "description": "Çocuk Alerji Kliniği — çok kullanıcılı randevu yönetim sunucusu",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "express": "^4.19.0",
+    "pg": "^8.12.0"
+  }
+}

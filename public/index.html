@@ -247,14 +247,35 @@ main{flex:1;max-width:1280px;margin:0 auto;width:100%;padding:16px}
    ============================================================ */
 /* Sunuculu sürüm — veriler REST API üzerinden ortak veritabanında tutulur */
 
-const STAFF = [
-  {id:'dr_sevgi', name:'Dr. Sevgi', role:'doktor'},
-  {id:'dr_ezgi',  name:'Dr. Ezgi',  role:'doktor'},
-  {id:'dr_nilay', name:'Dr. Nilay', role:'doktor'},
-  {id:'hem_ezgi', name:'Hemşire Ezgi',  role:'hemsire'},
-  {id:'hem_2',    name:'Hemşire Hayriye', role:'hemsire'},
-  {id:'hem_3',    name:'Hemşire Fatma',   role:'hemsire'},
-];
+/* Varsayılan klinik yapılandırması — Ayarlar → 🏥 Klinik ekranından düzenlenir,
+   veritabanında saklanır ve tüm cihazlara yansır. */
+const DEFAULT_CONFIG = {
+  staff: [
+    {id:'dr_sevgi', name:'Dr. Sevgi', role:'doktor'},
+    {id:'dr_ezgi',  name:'Dr. Ezgi',  role:'doktor'},
+    {id:'dr_nilay', name:'Dr. Nilay', role:'doktor'},
+    {id:'hem_ezgi', name:'Hemşire Ezgi',    role:'hemsire'},
+    {id:'hem_2',    name:'Hemşire Hayriye', role:'hemsire'},
+    {id:'hem_3',    name:'Hemşire Fatma',   role:'hemsire'},
+  ],
+  criticalNurseId: 'hem_ezgi',
+  sftSlots: ['10:00','10:30','14:00','14:30'],
+  provTime: '09:00',
+  provPlan: {
+    1: [{doctorId:'dr_sevgi', cap:4}],
+    2: [{doctorId:'dr_ezgi',  cap:4}],
+    3: [{doctorId:'dr_nilay', cap:4}],
+    4: [{doctorId:'dr_nilay', cap:4}],
+    5: [{doctorId:'dr_sevgi', cap:2},{doctorId:'dr_ezgi', cap:2}],
+  },
+  provDailyMax: 4,
+  provDailyMaxCrit: 2,
+  ptpMaxCrit: 3,
+  ptpCritSlots: ['10:00','14:00'],
+  idtSlots: ['09:30','10:00','10:30','11:00','14:00','14:30'],
+  ptpSlots: ['09:30','10:00','10:30','11:00','11:30','14:00','14:30','15:00','15:30'],
+};
+function cfgOf(db){ return (db && db.config) ? db.config : DEFAULT_CONFIG; }
 
 const TYPES = {
   sft:       {key:'sft',       name:'SFT (Solunum Fonksiyon Testi)', short:'SFT',        color:'var(--sft)',      bg:'var(--sft-bg)'},
@@ -264,25 +285,7 @@ const TYPES = {
   ptp:       {key:'ptp',       name:'Prick to Prick Test',           short:'Prick²',      color:'var(--ptp)',      bg:'var(--ptp-bg)'},
 };
 
-const SFT_SLOTS = ['10:00','10:30','14:00','14:30'];
-const PROV_TIME = '09:00';
-const IDT_SLOTS = ['09:30','10:00','10:30','11:00','14:00','14:30'];
-const PTP_SLOTS = ['09:30','10:00','10:30','11:00','11:30','14:00','14:30','15:00','15:30'];
-const PTP_EZGI_LEAVE_SLOTS = ['10:00','14:00'];
-
 const IDT_GROUPS = ['Penisilin','Parasetamol','Diğer'];
-
-/* Provokasyon doktor planı — haftanın gününe göre (1=Pzt … 5=Cum) */
-const PROV_DOCTOR_PLAN = {
-  1: [{doctorId:'dr_sevgi', cap:4}],
-  2: [{doctorId:'dr_ezgi',  cap:4}],
-  3: [{doctorId:'dr_nilay', cap:4}],
-  4: [{doctorId:'dr_nilay', cap:4}],
-  5: [{doctorId:'dr_sevgi', cap:2},{doctorId:'dr_ezgi', cap:2}],
-};
-const PROV_DAILY_MAX = 4;
-const PROV_DAILY_MAX_EZGI_LEAVE = 2;
-const PTP_MAX_EZGI_LEAVE = 3;
 
 /* Resmi tatiller (2026–2027, doğrulanmış) — Ayarlar'dan düzenlenebilir */
 const DEFAULT_HOLIDAYS = [
@@ -327,11 +330,14 @@ async function sha256(s){
 }
 function freshDB(){
   return {users: DB ? DB.users : [], appointments: [], leaves: [],
-    holidays: JSON.parse(JSON.stringify(DEFAULT_HOLIDAYS)), audit: []};
+    holidays: JSON.parse(JSON.stringify(DEFAULT_HOLIDAYS)),
+    config: DB && DB.config ? DB.config : JSON.parse(JSON.stringify(DEFAULT_CONFIG)),
+    audit: []};
 }
 async function fetchState(){
   const s = await api('GET', '/api/state');
   DB = s.db; VERSION = s.version;
+  if(!DB.config){ DB.config = JSON.parse(JSON.stringify(DEFAULT_CONFIG)); saveDB(); }
 }
 function saveDB(){
   api('PUT', '/api/state', {version: VERSION, db: DB}).then(r => {
@@ -392,24 +398,26 @@ function apptsOn(iso, db, type){
 function getDayStatus(iso, db){
   const work = isWorkday(iso, db);
   const wd = dayOfWeek(iso);
-  const ezgiLeave = isStaffOnLeave('hem_ezgi', iso, db);
+  const cfg = cfgOf(db);
+  const ezgiLeave = cfg.criticalNurseId ? isStaffOnLeave(cfg.criticalNurseId, iso, db) : false;
 
-  // SFT: bağımsız, 4 sabit seans
+  // SFT: bağımsız, sabit seans listesi (kapasite = seans sayısı)
   const sftAppts = apptsOn(iso, db, 'sft');
   const sft = {
-    max: SFT_SLOTS.length,
+    max: cfg.sftSlots.length,
     used: sftAppts.length,
-    slots: SFT_SLOTS.map(t => ({time:t, appt: sftAppts.find(a => a.time === t) || null})),
+    appts: sftAppts,
+    slots: cfg.sftSlots.map(t => ({time:t, appt: sftAppts.find(a => a.time === t) || null})),
   };
 
   // Provokasyonlar: ilaç + besin ortak havuz, 09:00, doktor-gün planı
   const provAppts = [...apptsOn(iso, db, 'ilac_prov'), ...apptsOn(iso, db, 'besin_prov')];
-  const plan = (PROV_DOCTOR_PLAN[wd] || []).map(p => {
+  const plan = (cfg.provPlan[wd] || []).map(p => {
     const onLeave = isStaffOnLeave(p.doctorId, iso, db);
     const used = provAppts.filter(a => a.doctorId === p.doctorId).length;
     return {...p, onLeave, used, open: onLeave ? 0 : Math.max(0, p.cap - used)};
   });
-  const provMax = ezgiLeave ? PROV_DAILY_MAX_EZGI_LEAVE : PROV_DAILY_MAX;
+  const provMax = ezgiLeave ? cfg.provDailyMaxCrit : cfg.provDailyMax;
   const provUsed = provAppts.length;
   const provDoctorOpen = plan.reduce((s,p) => s + p.open, 0);
   const prov = {
@@ -431,8 +439,8 @@ function getDayStatus(iso, db){
   const ptpAppts = apptsOn(iso, db, 'ptp');
   const ptp = {
     appts: ptpAppts, used: ptpAppts.length,
-    max: ezgiLeave ? PTP_MAX_EZGI_LEAVE : Infinity,
-    slots: ezgiLeave ? PTP_EZGI_LEAVE_SLOTS : PTP_SLOTS,
+    max: ezgiLeave ? cfg.ptpMaxCrit : Infinity,
+    slots: ezgiLeave ? cfg.ptpCritSlots : cfg.ptpSlots,
     ezgiLeave,
   };
 
@@ -448,37 +456,39 @@ function pickProvDoctor(status){
 
 /* --- Randevu doğrulama: {ok, errors[], warnings[], assign{}} --- */
 function validateAppointment(req, db){
+  const cfg = cfgOf(db);
   const errors = [], warnings = [], assign = {};
   const work = isWorkday(req.date, db);
   if(!work.ok){ errors.push(work.reason); return {ok:false, errors, warnings, assign}; }
   const st = getDayStatus(req.date, db);
+  const critName = cfg.criticalNurseId ? staffName(cfg.criticalNurseId, db) : 'Kritik hemşire';
 
   if(req.type === 'sft'){
-    if(!SFT_SLOTS.includes(req.time)) errors.push('SFT yalnızca 10:00, 10:30, 14:00, 14:30 seanslarına verilebilir.');
+    if(!cfg.sftSlots.includes(req.time)) errors.push('SFT yalnızca ' + cfg.sftSlots.join(', ') + ' seanslarına verilebilir.');
     else {
       const slot = st.sft.slots.find(s => s.time === req.time);
       if(slot.appt && slot.appt.id !== req.id) errors.push('Bu SFT seansı dolu (' + req.time + ').');
     }
     if(st.sft.used >= st.sft.max && !st.sft.slots.some(s => s.appt && s.appt.id === req.id))
-      errors.push('SFT günlük kapasitesi dolu (maks. 4).');
+      errors.push('SFT günlük kapasitesi dolu (maks. ' + st.sft.max + ').');
   }
 
   else if(req.type === 'ilac_prov' || req.type === 'besin_prov'){
-    assign.time = PROV_TIME;
+    assign.time = cfg.provTime;
     const editingSameDay = req.id && st.prov.appts.some(a => a.id === req.id);
     const usedExcl = st.prov.used - (editingSameDay ? 1 : 0);
     if(usedExcl >= st.prov.max){
       errors.push(st.ezgiLeave
-        ? 'Hemşire Ezgi izinli: provokasyon limiti bugün 2 ve doldu.'
-        : 'Günlük toplam provokasyon limiti (4) doldu.');
+        ? critName + ' izinli: provokasyon limiti bugün ' + st.prov.max + ' ve doldu.'
+        : 'Günlük toplam provokasyon limiti (' + st.prov.max + ') doldu.');
     }
     let docId = req.doctorId;
     if(docId){
       const p = st.prov.plan.find(p => p.doctorId === docId);
       if(!p) errors.push('Seçilen doktorun bu gün provokasyon günü değil.');
-      else if(p.onLeave) errors.push(staffName(docId) + ' bu tarihte izinli — slotlar kapalı.');
+      else if(p.onLeave) errors.push(staffName(docId, db) + ' bu tarihte izinli — slotlar kapalı.');
       else if(p.open <= 0 && !(editingSameDay && st.prov.appts.find(a=>a.id===req.id && a.doctorId===docId)))
-        errors.push(staffName(docId) + ' için bu günün provokasyon kotası dolu.');
+        errors.push(staffName(docId, db) + ' için bu günün provokasyon kotası dolu.');
     } else {
       docId = pickProvDoctor(st);
       if(!docId && usedExcl < st.prov.max)
@@ -486,7 +496,7 @@ function validateAppointment(req, db){
     }
     assign.doctorId = docId;
     if(st.ezgiLeave && errors.length === 0)
-      warnings.push('Hemşire Ezgi izinli: bu günde provokasyon limiti 2\'ye düşürüldü.');
+      warnings.push(critName + ' izinli: bu günde provokasyon limiti ' + st.prov.max + "'e düşürüldü.");
   }
 
   else if(req.type === 'idt'){
@@ -501,18 +511,18 @@ function validateAppointment(req, db){
       else
         warnings.push('Eşleşme tamamlandı: bu gün 2. ' + req.drugGroup + ' hastası. ✓');
     }
-    if(!IDT_SLOTS.includes(req.time)) errors.push('Geçerli bir seans saati seçiniz.');
+    if(!cfg.idtSlots.includes(req.time)) errors.push('Geçerli bir seans saati seçiniz.');
   }
 
   else if(req.type === 'ptp'){
     if(st.ptp.ezgiLeave){
       const editingSame = req.id && st.ptp.appts.some(a => a.id === req.id);
       const usedExcl = st.ptp.used - (editingSame ? 1 : 0);
-      if(usedExcl >= PTP_MAX_EZGI_LEAVE)
-        errors.push('Hemşire Ezgi izinli: Prick randevuları bugün en fazla 3 adet.');
-      if(!PTP_EZGI_LEAVE_SLOTS.includes(req.time))
-        errors.push('Hemşire Ezgi izinli: Prick randevuları yalnızca 10:00 ve 14:00 seanslarına verilebilir.');
-    } else if(!PTP_SLOTS.includes(req.time)){
+      if(usedExcl >= st.ptp.max)
+        errors.push(critName + ' izinli: Prick randevuları bugün en fazla ' + st.ptp.max + ' adet.');
+      if(!st.ptp.slots.includes(req.time))
+        errors.push(critName + ' izinli: Prick randevuları yalnızca ' + st.ptp.slots.join(' ve ') + ' seanslarına verilebilir.');
+    } else if(!cfg.ptpSlots.includes(req.time)){
       errors.push('Geçerli bir seans saati seçiniz.');
     }
   }
@@ -543,7 +553,7 @@ function suggestIdtDays(drugGroup, fromIso, db, horizon){
 
 /* ===== RULES ENGINE END ===== */
 
-function staffName(id){ const s = STAFF.find(s => s.id === id); return s ? s.name : id; }
+function staffName(id, db){ const s = cfgOf(db || DB).staff.find(s => s.id === id); return s ? s.name : id; }
 
 /* ============================================================
    BÖLÜM 4: OTURUM (AUTH)
@@ -649,7 +659,7 @@ function dayColumn(iso){
     body = `<div class="day-closed-msg">Randevu alımına kapalı</div>`;
   } else {
     /* Provokasyonlar 09:00 */
-    body += `<div class="slot-group-title">09:00 · Provokasyon (${st.prov.used}/${st.prov.max})</div>`;
+    body += `<div class="slot-group-title">${cfgOf(DB).provTime} · Provokasyon (${st.prov.used}/${st.prov.max})</div>`;
     st.prov.plan.forEach(p => {
       const docAppts = st.prov.appts.filter(a => a.doctorId === p.doctorId);
       docAppts.forEach(a => body += apptCard(a));
@@ -658,16 +668,17 @@ function dayColumn(iso){
       } else {
         const room = Math.min(p.cap - docAppts.length, st.prov.max - st.prov.used);
         for(let i = 0; i < room; i++)
-          body += `<button class="free-slot" onclick="openNewAppt({date:'${iso}',type:'ilac_prov',doctorId:'${p.doctorId}'})">+ 09:00 · ${esc(staffName(p.doctorId))} · Provokasyon</button>`;
+          body += `<button class="free-slot" onclick="openNewAppt({date:'${iso}',type:'ilac_prov',doctorId:'${p.doctorId}'})">+ ${cfgOf(DB).provTime} · ${esc(staffName(p.doctorId))} · Provokasyon</button>`;
       }
     });
 
     /* SFT */
-    body += `<div class="slot-group-title">SFT (${st.sft.used}/4)</div>`;
+    body += `<div class="slot-group-title">SFT (${st.sft.used}/${st.sft.max})</div>`;
     st.sft.slots.forEach(s => {
       if(s.appt) body += apptCard(s.appt);
       else body += `<button class="free-slot" onclick="openNewAppt({date:'${iso}',type:'sft',time:'${s.time}'})">+ ${s.time} · SFT</button>`;
     });
+    st.sft.appts.filter(a => !st.sft.slots.some(s => s.time === a.time)).forEach(a => body += apptCard(a));
 
     /* İlaç Deri Testi */
     const idtList = st.idt.appts;
@@ -678,7 +689,7 @@ function dayColumn(iso){
 
     /* Prick to Prick */
     const ptpCap = st.ptp.max === Infinity ? '∞' : st.ptp.used + '/' + st.ptp.max;
-    body += `<div class="slot-group-title">Prick to Prick (${ptpCap})${st.ptp.ezgiLeave ? ' — sadece 10:00/14:00' : ''}</div>`;
+    body += `<div class="slot-group-title">Prick to Prick (${ptpCap})${st.ptp.ezgiLeave ? ' — sadece ' + st.ptp.slots.join('/') : ''}</div>`;
     st.ptp.appts.forEach(a => body += apptCard(a));
     if(st.ptp.used < st.ptp.max)
       body += `<button class="free-slot" onclick="openNewAppt({date:'${iso}',type:'ptp'})">+ Prick to Prick ekle</button>`;
@@ -735,7 +746,7 @@ function renderMonth(){
       const idtN = st.idt.appts.length;
       const ptpN = st.ptp.used;
       inner += `<div class="mcaps">
-        <div class="mcap" style="background:var(--sft-bg);color:var(--sft)"><span>SFT</span><span>${st.sft.used}/4</span></div>
+        <div class="mcap" style="background:var(--sft-bg);color:var(--sft)"><span>SFT</span><span>${st.sft.used}/${st.sft.max}</span></div>
         <div class="mcap" style="background:var(--ilacprov-bg);color:var(--ilacprov)"><span>Prov</span><span>${st.prov.used}/${st.prov.max}</span></div>
         ${idtN ? `<div class="mcap" style="background:var(--idt-bg);color:var(--idt)"><span>İDT</span><span>${idtN}</span></div>` : ''}
         ${ptpN ? `<div class="mcap" style="background:var(--ptp-bg);color:var(--ptp)"><span>P²</span><span>${ptpN}${st.ptp.max !== Infinity ? '/' + st.ptp.max : ''}</span></div>` : ''}
@@ -796,13 +807,13 @@ function drawApptForm(){
       st.sft.slots.map(s => `<button ${s.appt ? 'disabled' : ''} class="${a.time === s.time ? 'sel' : ''}" onclick="DRAFT.time='${s.time}';drawApptForm()">${s.time}${s.appt ? ' · dolu' : ''}</button>`).join('') + `</div></div>`;
   } else if(a.type === 'ilac_prov' || a.type === 'besin_prov'){
     timeUI = `<div class="field"><label>Başlama Saati</label>
-      <div class="alert alert-info" style="margin-bottom:0">Tüm provokasyonlar sabit <b>09:00</b>'da başlar.${st ? ' Görevli doktor: <b>' + provDoctorLabel(st) + '</b>' : ''}</div></div>`;
+      <div class="alert alert-info" style="margin-bottom:0">Tüm provokasyonlar sabit <b>${cfgOf(DB).provTime}</b>'da başlar.${st ? ' Görevli doktor: <b>' + provDoctorLabel(st) + '</b>' : ''}</div></div>`;
   } else if(a.type === 'idt'){
     timeUI = `<div class="field"><label>Seans Saati</label><div class="slot-pick">` +
-      IDT_SLOTS.map(t => `<button class="${a.time === t ? 'sel' : ''}" onclick="DRAFT.time='${t}';drawApptForm()">${t}</button>`).join('') + `</div></div>`;
+      cfgOf(DB).idtSlots.map(t => `<button class="${a.time === t ? 'sel' : ''}" onclick="DRAFT.time='${t}';drawApptForm()">${t}</button>`).join('') + `</div></div>`;
   } else if(a.type === 'ptp' && st){
     const slots = st.ptp.slots;
-    timeUI = `<div class="field"><label>Seans Saati${st.ptp.ezgiLeave ? ' (Hemşire Ezgi izinli — kısıtlı)' : ''}</label><div class="slot-pick">` +
+    timeUI = `<div class="field"><label>Seans Saati${st.ptp.ezgiLeave ? ' (${esc(staffName(cfgOf(DB).criticalNurseId))} izinli — kısıtlı)' : ''}</label><div class="slot-pick">` +
       slots.map(t => `<button class="${a.time === t ? 'sel' : ''}" onclick="DRAFT.time='${t}';drawApptForm()">${t}</button>`).join('') + `</div></div>`;
   }
 
@@ -865,7 +876,7 @@ function provDoctorLabel(st){
 function previewValidation(){
   const a = DRAFT;
   const req = {...a};
-  if(a.type === 'ilac_prov' || a.type === 'besin_prov') req.time = PROV_TIME;
+  if(a.type === 'ilac_prov' || a.type === 'besin_prov') req.time = cfgOf(DB).provTime;
   if(!req.time && (a.type === 'sft' || a.type === 'idt' || a.type === 'ptp'))
     return {ok:false, errors: isWorkday(a.date, DB).ok ? [] : [isWorkday(a.date, DB).reason], warnings:[], incomplete:true};
   return validateAppointment(req, DB);
@@ -874,7 +885,7 @@ function previewValidation(){
 function saveAppt(){
   const a = DRAFT;
   const req = {...a};
-  if(a.type === 'ilac_prov' || a.type === 'besin_prov') req.time = PROV_TIME;
+  if(a.type === 'ilac_prov' || a.type === 'besin_prov') req.time = cfgOf(DB).provTime;
   const v = validateAppointment(req, DB);
   if(!v.ok){ toast('Kaydedilemedi: ' + v.errors[0]); drawApptForm(); return; }
   if(v.assign.time) req.time = v.assign.time;
@@ -990,9 +1001,9 @@ function openPanel(which){
 
 function drawLeavesPanel(){
   const rows = DB.leaves.slice().sort((a,b) => a.start < b.start ? 1 : -1).map(l => {
-    const s = STAFF.find(s => s.id === l.staffId);
-    const effect = s.id === 'hem_ezgi'
-      ? 'Prov. limiti→2 · Prick maks 3 (10:00/14:00)'
+    const s = cfgOf(DB).staff.find(x => x.id === l.staffId) || {id:l.staffId, name:l.staffId, role:'hemsire'};
+    const effect = s.id === cfgOf(DB).criticalNurseId
+      ? `Prov. limiti→${cfgOf(DB).provDailyMaxCrit} · Prick maks ${cfgOf(DB).ptpMaxCrit} (${cfgOf(DB).ptpCritSlots.join('/')})`
       : s.role === 'doktor' ? 'Provokasyon slotları kapalı' : 'Genel kapasite notu';
     return `<div class="list-row"><div>
         <b>🌴 ${esc(s.name)}</b> — ${fmtShort(l.start)} → ${fmtShort(l.end)}
@@ -1005,7 +1016,7 @@ function drawLeavesPanel(){
     <div class="modal-body">
       <div class="grid2">
         <div class="field"><label>Personel</label>
-          <select id="lv_staff">${STAFF.map(s => `<option value="${s.id}">${s.name} (${s.role === 'doktor' ? 'Doktor' : 'Hemşire'})</option>`).join('')}</select></div>
+          <select id="lv_staff">${cfgOf(DB).staff.map(s => `<option value="${s.id}">${s.name} (${s.role === 'doktor' ? 'Doktor' : 'Hemşire'})</option>`).join('')}</select></div>
         <div class="field"><label>Not</label><input id="lv_note" placeholder="Yıllık izin, kongre…"></div>
       </div>
       <div class="grid2">
@@ -1016,7 +1027,7 @@ function drawLeavesPanel(){
       <div class="section-title">Kayıtlı İzinler</div>
       ${rows}
       <div class="alert alert-info" style="margin-top:12px">Doktor izni → o günkü provokasyon slotları otomatik kapanır.<br>
-      <b>Hemşire Ezgi</b> izni → provokasyon limiti 4→2, Prick randevuları maks 3 (yalnız 10:00 &amp; 14:00).</div>
+      <b>${esc(staffName(cfgOf(DB).criticalNurseId))}</b> izni → provokasyon limiti ${cfgOf(DB).provDailyMax}→${cfgOf(DB).provDailyMaxCrit}, Prick maks ${cfgOf(DB).ptpMaxCrit} (yalnız ${cfgOf(DB).ptpCritSlots.join(' &amp; ')}).</div>
     </div>
     <div class="modal-foot"><button class="btn btn-primary" onclick="closeModal();render()">Kapat</button></div>`, true);
 }
@@ -1029,7 +1040,7 @@ function addLeave(){
   if(!start || !end || end < start){ toast('Tarih aralığı hatalı'); return; }
   // Çakışma kontrolü: izinli günlerdeki mevcut randevular
   const affected = DB.appointments.filter(a => a.date >= start && a.date <= end &&
-    (a.doctorId === staffId || (staffId === 'hem_ezgi' && ['ilac_prov','besin_prov','ptp'].includes(a.type))));
+    (a.doctorId === staffId || (staffId === cfgOf(DB).criticalNurseId && ['ilac_prov','besin_prov','ptp'].includes(a.type))));
   if(affected.length && !confirm(`Dikkat: bu aralıkta ${affected.length} mevcut randevu etkileniyor (${affected.map(a=>a.patient).slice(0,3).join(', ')}${affected.length>3?'…':''}). Yine de izin eklensin mi? Randevuları manuel taşımanız gerekir.`)) return;
   DB.leaves.push({id: uid(), staffId, start, end, note});
   logAudit('leave_add', staffName(staffId) + ' ' + start + '→' + end);
@@ -1041,10 +1052,11 @@ function deleteLeave(id){
 }
 
 function drawSettingsPanel(tab){
-  const tabs = [['holidays','⛔ Tatiller'],['users','👤 Kullanıcılar'],['backup','💾 Yedek'],['audit','📜 Kayıt Geçmişi']];
+  const tabs = [['clinic','🏥 Klinik'],['holidays','⛔ Tatiller'],['users','👤 Kullanıcılar'],['backup','💾 Yedek'],['audit','📜 Kayıt Geçmişi']];
   let body = '';
 
-  if(tab === 'holidays'){
+  if(tab === 'clinic'){ body = clinicTabBody(); }
+  else if(tab === 'holidays'){
     body = `<div class="grid2">
       <div class="field"><label>Tarih</label><input type="date" id="hd_date"></div>
       <div class="field"><label>Tatil Adı</label><input id="hd_name" placeholder="Örn: İdari izin"></div></div>
@@ -1089,6 +1101,114 @@ function drawSettingsPanel(tab){
       ${body}
     </div>
     <div class="modal-foot"><button class="btn btn-primary" onclick="closeModal();render()">Kapat</button></div>`, true);
+}
+
+function clinicTabBody(){
+  const cfg = cfgOf(DB);
+  if(SESSION.role !== 'admin')
+    return '<div class="alert alert-warn">Klinik ayarları yalnızca Yönetici rolünde düzenlenebilir.</div>';
+  const docs = cfg.staff.filter(s => s.role === 'doktor');
+  const nurses = cfg.staff.filter(s => s.role === 'hemsire');
+  const docOpt = sel => `<option value="">— yok —</option>` + docs.map(d => `<option value="${d.id}" ${sel === d.id ? 'selected' : ''}>${esc(d.name)}</option>`).join('');
+  const dayNames = {1:'Pazartesi', 2:'Salı', 3:'Çarşamba', 4:'Perşembe', 5:'Cuma'};
+
+  let h = `<div class="alert alert-info">Buradaki değişiklikler kaydedilince tüm cihazlara yansır. Saat listeleri virgülle yazılır (örn: 10:00, 10:30).</div>`;
+
+  h += `<div class="section-title">Personel</div>`;
+  h += cfg.staff.map(s => `<div class="list-row"><div style="flex:1;display:flex;gap:8px;align-items:center">
+      <input id="cs_n_${s.id}" value="${esc(s.name)}" style="max-width:230px">
+      <span class="meta">${s.role === 'doktor' ? 'Doktor' : 'Hemşire'}</span></div>
+      <button class="btn btn-danger btn-sm" onclick="removeStaff('${s.id}')">Sil</button></div>`).join('');
+  h += `<div class="grid2" style="margin-top:8px">
+      <div class="field"><label>Yeni Personel Adı</label><input id="cs_name" placeholder="Dr. Ali / Hemşire Ayşe"></div>
+      <div class="field"><label>Rol</label><select id="cs_role"><option value="doktor">Doktor</option><option value="hemsire">Hemşire</option></select></div></div>
+    <button class="btn btn-ghost btn-sm" onclick="addStaffMember()">+ Personel Ekle</button>`;
+
+  h += `<div class="section-title">Provokasyon Doktor-Gün Planı</div>
+    <div class="meta" style="margin-bottom:6px">Her gün için görevli doktor(lar) ve hasta kotaları. İkinci doktor gerekmiyorsa "— yok —" bırakın.</div>`;
+  for(let d = 1; d <= 5; d++){
+    const p = cfg.provPlan[d] || [];
+    h += `<div class="list-row"><b style="min-width:80px">${dayNames[d]}</b>
+      <div style="flex:1;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      <select id="pp_${d}_0" style="max-width:150px">${docOpt(p[0] && p[0].doctorId)}</select>
+      <input id="ppc_${d}_0" value="${p[0] ? p[0].cap : ''}" placeholder="kota" inputmode="numeric" style="max-width:64px">
+      <select id="pp_${d}_1" style="max-width:150px">${docOpt(p[1] && p[1].doctorId)}</select>
+      <input id="ppc_${d}_1" value="${p[1] ? p[1].cap : ''}" placeholder="kota" inputmode="numeric" style="max-width:64px">
+      </div></div>`;
+  }
+
+  h += `<div class="section-title">Seanslar ve Kotalar</div><div class="grid2">
+    <div class="field"><label>SFT seansları (kapasite = seans sayısı)</label><input id="cc_sft" value="${cfg.sftSlots.join(', ')}"></div>
+    <div class="field"><label>Provokasyon başlama saati</label><input id="cc_provtime" value="${cfg.provTime}"></div>
+    <div class="field"><label>Günlük toplam provokasyon limiti</label><input id="cc_provmax" value="${cfg.provDailyMax}" inputmode="numeric"></div>
+    <div class="field"><label>İlaç Deri Testi seansları</label><input id="cc_idt" value="${cfg.idtSlots.join(', ')}"></div>
+    <div class="field"><label>Prick to Prick seansları</label><input id="cc_ptp" value="${cfg.ptpSlots.join(', ')}"></div>
+  </div>`;
+
+  h += `<div class="section-title">Kritik Hemşire İzin Kuralları</div><div class="grid2">
+    <div class="field"><label>Kritik hemşire (izni kapasiteyi düşürür)</label>
+      <select id="cc_crit"><option value="">— yok —</option>${nurses.map(n => `<option value="${n.id}" ${cfg.criticalNurseId === n.id ? 'selected' : ''}>${esc(n.name)}</option>`).join('')}</select></div>
+    <div class="field"><label>İzindeyken provokasyon limiti</label><input id="cc_provcrit" value="${cfg.provDailyMaxCrit}" inputmode="numeric"></div>
+    <div class="field"><label>İzindeyken Prick limiti</label><input id="cc_ptpmaxcrit" value="${cfg.ptpMaxCrit}" inputmode="numeric"></div>
+    <div class="field"><label>İzindeyken Prick seansları</label><input id="cc_ptpcrit" value="${cfg.ptpCritSlots.join(', ')}"></div>
+  </div>
+  <button class="btn btn-primary" onclick="saveClinicCfg()">💾 Ayarları Kaydet</button>`;
+  return h;
+}
+
+function cval(id){ const e = document.getElementById(id); return e ? e.value.trim() : ''; }
+function parseTimes(s){ return s.split(',').map(x => x.trim()).filter(x => /^\d{1,2}:\d{2}$/.test(x)); }
+
+function saveClinicCfg(){
+  const cfg = JSON.parse(JSON.stringify(cfgOf(DB)));
+  const sft = parseTimes(cval('cc_sft'));
+  if(!sft.length){ toast('SFT seans listesi boş veya hatalı'); return; }
+  cfg.sftSlots = sft;
+  const idt = parseTimes(cval('cc_idt')); if(idt.length) cfg.idtSlots = idt;
+  const ptp = parseTimes(cval('cc_ptp')); if(ptp.length) cfg.ptpSlots = ptp;
+  const ptc = parseTimes(cval('cc_ptpcrit')); if(ptc.length) cfg.ptpCritSlots = ptc;
+  if(/^\d{1,2}:\d{2}$/.test(cval('cc_provtime'))) cfg.provTime = cval('cc_provtime');
+  cfg.provDailyMax = Math.max(1, parseInt(cval('cc_provmax')) || cfg.provDailyMax);
+  cfg.provDailyMaxCrit = Math.max(0, parseInt(cval('cc_provcrit')) || cfg.provDailyMaxCrit);
+  cfg.ptpMaxCrit = Math.max(0, parseInt(cval('cc_ptpmaxcrit')) || cfg.ptpMaxCrit);
+  cfg.criticalNurseId = cval('cc_crit');
+  cfg.staff = cfg.staff.map(s => ({...s, name: cval('cs_n_' + s.id) || s.name}));
+  const plan = {};
+  for(let d = 1; d <= 5; d++){
+    plan[d] = [];
+    for(let k = 0; k < 2; k++){
+      const doc = cval(`pp_${d}_${k}`);
+      const cap = parseInt(cval(`ppc_${d}_${k}`)) || 0;
+      if(doc && cap > 0 && !plan[d].some(x => x.doctorId === doc)) plan[d].push({doctorId: doc, cap});
+    }
+  }
+  cfg.provPlan = plan;
+  DB.config = cfg;
+  logAudit('config', 'Klinik ayarları güncellendi');
+  saveDB(); render(); drawSettingsPanel('clinic'); toast('Klinik ayarları kaydedildi ✓');
+}
+
+function addStaffMember(){
+  const name = cval('cs_name');
+  const role = cval('cs_role') || 'doktor';
+  if(!name){ toast('Personel adı giriniz'); return; }
+  DB.config.staff.push({id: 'stf_' + uid(), name, role});
+  logAudit('config', 'Personel eklendi: ' + name);
+  saveDB(); drawSettingsPanel('clinic'); toast('Personel eklendi ✓ — doktoru gün planına atamayı unutmayın');
+}
+
+function removeStaff(id){
+  const s = cfgOf(DB).staff.find(x => x.id === id);
+  const used = DB.appointments.filter(a => a.doctorId === id).length;
+  const inPlan = Object.values(cfgOf(DB).provPlan).some(day => day.some(p => p.doctorId === id));
+  if(!confirm(`${s.name} silinsin mi?` + (used ? ` (${used} randevuda görevli görünüyor)` : '') + (inPlan ? ' Gün planından da çıkarılacak.' : ''))) return;
+  DB.config.staff = DB.config.staff.filter(x => x.id !== id);
+  Object.keys(DB.config.provPlan).forEach(d => {
+    DB.config.provPlan[d] = DB.config.provPlan[d].filter(p => p.doctorId !== id);
+  });
+  if(DB.config.criticalNurseId === id) DB.config.criticalNurseId = '';
+  logAudit('config', 'Personel silindi: ' + s.name);
+  saveDB(); drawSettingsPanel('clinic'); render(); toast('Personel silindi');
 }
 
 function addHoliday(){
@@ -1139,7 +1259,7 @@ function importJSON(input){
   r.readAsText(f);
 }
 function resetAll(){
-  if(!confirm('TÜM randevu/izin verileri silinecek (kullanıcılar korunur). Emin misiniz?')) return;
+  if(!confirm('TÜM randevu/izin verileri silinecek (kullanıcılar ve klinik ayarları korunur). Emin misiniz?')) return;
   DB = freshDB(); saveDB(); initLogin(); closeModal(); render(); toast('Sistem sıfırlandı');
 }
 
@@ -1165,6 +1285,6 @@ setInterval(async () => {
   }catch(e){}
 }, 15000);
 </script>
-<!-- v2.0 SUNUCULU — ortak veritabanı, çok kullanıcılı · TC Kimlik + Yaş · Hemşireler: Ezgi, Hayriye, Fatma -->
+<!-- v2.1 SUNUCULU — ortak veritabanı + klinik ayarları ekranı (personel/plan/kota düzenlenebilir) -->
 </body>
 </html>

@@ -1007,7 +1007,7 @@ function openApptDetail(id){
   if(!a) return;
   const t = TYPES[a.type];
   const fu = a.followUp || {};
-  const showFU = ['ilac_prov','besin_prov','idt','ptp'].includes(a.type);
+  const showFU = false; // Klinik takip verileri ayrı sistemde tutuluyor — randevu detayı sade bırakıldı
 
   const fuTable = showFU ? `
     <div class="section-title">Klinik Takip — Min/Maks Değer Girişi</div>

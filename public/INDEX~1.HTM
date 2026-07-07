@@ -224,6 +224,7 @@ main{flex:1;max-width:1280px;margin:0 auto;width:100%;padding:16px}
         <button id="btnMonth" onclick="setView('month')">Aylık</button>
       </div>
       <div class="topbar-actions">
+        <button class="btn btn-ghost btn-sm" onclick="openSearch()">🔍 Hasta Ara</button>
         <button class="btn btn-ghost btn-sm" onclick="openPanel('leaves')">🌴 İzinler</button>
         <button class="btn btn-ghost btn-sm" onclick="openPanel('settings')">⚙️</button>
         <div class="userbadge" id="userBadge"></div>
@@ -886,6 +887,14 @@ function drawApptForm(){
     alerts += `<label style="display:flex;gap:8px;align-items:center;font-size:13px;background:#fffbeb;border:1.5px dashed var(--warn);border-radius:9px;padding:9px 12px;cursor:pointer;margin-bottom:12px">
       <input type="checkbox" style="width:auto" ${a.override ? 'checked' : ''} onchange="DRAFT.override=this.checked;drawApptForm()">
       <span>⚡ <b>Kural dışı ek randevu</b> — kota dolu olsa bile oluştur (yönetici insiyatifi)</span></label>`;
+  if(!canSave && !a.override){
+    const missing = [];
+    if(!a.patient.trim()) missing.push('hasta adı');
+    if(!isProvT && !timeGiven) missing.push('seans saati seçimi');
+    if(a.type === 'idt' && !a.drugGroup && !(v.errors && v.errors.length)) missing.push('ilaç grubu');
+    if(missing.length)
+      alerts += `<div class="alert alert-info">ℹ Kaydet için eksik: <b>${missing.join(' + ')}</b></div>`;
+  }
 
   modal(`
     <div class="modal-head"><h3>${a.id ? 'Randevu Düzenle' : 'Yeni Randevu'}</h3><button class="modal-x" onclick="closeModal()">✕</button></div>
@@ -1062,6 +1071,44 @@ function deleteAppt(id){
 /* ============================================================
    BÖLÜM 10: İZİN ve AYARLAR PANELLERİ
    ============================================================ */
+function openSearch(){
+  modal(`
+    <div class="modal-head"><h3>🔍 Hasta Arama</h3><button class="modal-x" onclick="closeModal()">✕</button></div>
+    <div class="modal-body">
+      <div class="field"><label>Hasta adı, TC Kimlik No veya telefon</label>
+        <input id="srch" placeholder="En az 2 karakter yazın…" oninput="drawSearchResults()" autocomplete="off"></div>
+      <div id="srchOut"><div class="meta" style="color:var(--muted)">Hastanın tüm geçmiş ve gelecek randevuları listelenir.</div></div>
+    </div>
+    <div class="modal-foot"><button class="btn btn-primary" onclick="closeModal()">Kapat</button></div>`, true);
+  setTimeout(() => { const e = document.getElementById('srch'); if(e) e.focus(); }, 60);
+}
+function trLower(s){ return String(s || '').replace(/İ/g, 'i').replace(/I/g, 'ı').toLowerCase(); }
+function drawSearchResults(){
+  const q = trLower(document.getElementById('srch').value.trim());
+  const out = document.getElementById('srchOut');
+  if(q.length < 2){ out.innerHTML = '<div class="meta" style="color:var(--muted)">Aramak için en az 2 karakter girin.</div>'; return; }
+  const qNum = q.replace(/\s/g, '');
+  const hits = DB.appointments.filter(a =>
+    trLower(a.patient).includes(q) ||
+    (a.tc || '').includes(qNum) ||
+    (a.phone || '').replace(/\s/g, '').includes(qNum)
+  ).sort((x, y) => x.date === y.date ? (x.time < y.time ? -1 : 1) : (x.date < y.date ? -1 : 1));
+  if(!hits.length){ out.innerHTML = '<div class="alert alert-warn">Kayıt bulunamadı.</div>'; return; }
+  const today = todayISO();
+  const fut = hits.filter(a => a.date >= today);
+  const past = hits.filter(a => a.date < today).reverse();
+  const row = a => {
+    const t = TYPES[a.type];
+    return `<div class="list-row" style="cursor:pointer" onclick="openApptDetail('${a.id}')">
+      <div><b>${esc(a.patient)}</b>${a.status === 'geldi' ? ' ✓' : ''}${a.needsReschedule ? ' <span class="resched-chip">📞 ARANACAK</span>' : ''}${a.override ? ' ⚡' : ''}
+        <div class="meta">${fmtTR(a.date)} · ${a.time} · <span class="chip" style="background:${t.bg};color:${t.color}">${t.short}</span>${a.doctorId ? ' · ' + esc(staffName(a.doctorId)) : ''}${a.drugGroup ? ' · ' + esc(a.drugGroup) : ''}${a.tc ? ' · TC: ' + esc(a.tc) : ''}${a.phone ? ' · ' + esc(a.phone) : ''}</div></div>
+      <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();closeModal();gotoWeekOf('${a.date}')">Takvimde Aç</button></div>`;
+  };
+  out.innerHTML =
+    (fut.length ? `<div class="section-title">📅 Gelecek Randevular (${fut.length})</div>` + fut.map(row).join('') : '') +
+    (past.length ? `<div class="section-title">🕐 Geçmiş Randevular (${past.length})</div>` + past.map(row).join('') : '');
+}
+
 function openPanel(which){
   if(which === 'leaves') drawLeavesPanel();
   else drawSettingsPanel('holidays');

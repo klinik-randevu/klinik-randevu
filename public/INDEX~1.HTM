@@ -905,7 +905,7 @@ function drawApptForm(){
         </select></div>
       <div class="grid2">
         <div class="field"><label>Tarih</label><input type="date" value="${a.date}" onchange="DRAFT.date=this.value;DRAFT.time='';drawApptForm()"></div>
-        <div class="field"><label>Hasta Adı Soyadı *</label><input value="${esc(a.patient)}" oninput="DRAFT.patient=this.value" placeholder="Örn: Ali Yılmaz"></div>
+        <div class="field"><label>Hasta Adı Soyadı *</label><input value="${esc(a.patient)}" oninput="DRAFT.patient=this.value;updateSaveBtn()" placeholder="Örn: Ali Yılmaz"></div>
       </div>
       <div class="grid2">
         <div class="field"><label>TC Kimlik No</label><input value="${esc(a.tc || '')}" oninput="DRAFT.tc=this.value.replace(/\D/g,'').slice(0,11)" inputmode="numeric" maxlength="11" placeholder="11 haneli"></div>
@@ -920,8 +920,18 @@ function drawApptForm(){
     </div>
     <div class="modal-foot">
       <button class="btn btn-ghost" onclick="closeModal()">Vazgeç</button>
-      <button class="btn btn-primary" ${canSave ? '' : 'disabled'} onclick="saveAppt()">Kaydet</button>
+      <button id="btnSave" class="btn btn-primary" ${canSave ? '' : 'disabled'} onclick="saveAppt()">Kaydet</button>
     </div>`, false);
+}
+
+function updateSaveBtn(){
+  const a = DRAFT; if(!a) return;
+  const btn = document.getElementById('btnSave'); if(!btn) return;
+  const wk = isWorkday(a.date, DB).ok;
+  const isProvT = (a.type === 'ilac_prov' || a.type === 'besin_prov');
+  const timeGiven = (isProvT && !a.override) ? true : /^\d{1,2}:\d{2}$/.test(a.time || (isProvT ? cfgOf(DB).provTime : ''));
+  const v = previewValidation();
+  btn.disabled = !(!!a.patient.trim() && (a.override ? (wk && timeGiven) : v.ok));
 }
 
 function provDoctorLabel(st){

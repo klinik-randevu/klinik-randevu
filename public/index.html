@@ -471,6 +471,15 @@ function validateAppointment(req, db){
   if(!work.ok){ errors.push(work.reason); return {ok:false, errors, warnings, assign}; }
   const st = getDayStatus(req.date, db);
   const critName = cfg.criticalNurseId ? staffName(cfg.criticalNurseId, db) : 'Kritik hemşire';
+  const requireDoctor = () => {
+    if(!req.doctorId) errors.push('Doktor seçiniz.');
+    else if(isStaffOnLeave(req.doctorId, req.date, db)){
+      if(req.forceLeave)
+        warnings.push(staffName(req.doctorId, db) + ' bu tarihte izinli — onayınızla yine de eklendi.');
+      else
+        errors.push(staffName(req.doctorId, db) + ' bu tarihte izinli. Eklemek istiyorsanız "yine de ekle" kutusunu işaretleyin.');
+    }
+  };
 
   if(req.type === 'sft'){
     if(!cfg.sftSlots.includes(req.time)) errors.push('SFT yalnızca ' + cfg.sftSlots.join(', ') + ' seanslarına verilebilir.');
@@ -480,6 +489,7 @@ function validateAppointment(req, db){
     }
     if(st.sft.used >= st.sft.max && !st.sft.slots.some(s => s.appt && s.appt.id === req.id))
       errors.push('SFT günlük kapasitesi dolu (maks. ' + st.sft.max + ').');
+    requireDoctor();
   }
 
   else if(req.type === 'ilac_prov' || req.type === 'besin_prov'){
@@ -521,6 +531,7 @@ function validateAppointment(req, db){
         warnings.push('Eşleşme tamamlandı: bu gün 2. ' + req.drugGroup + ' hastası. ✓');
     }
     if(!cfg.idtSlots.includes(req.time)) errors.push('Geçerli bir seans saati seçiniz.');
+    requireDoctor();
   }
 
   else if(req.type === 'ptp'){
@@ -534,6 +545,7 @@ function validateAppointment(req, db){
     } else if(!cfg.ptpSlots.includes(req.time)){
       errors.push('Geçerli bir seans saati seçiniz.');
     }
+    requireDoctor();
   }
 
   else errors.push('Bilinmeyen işlem türü.');
@@ -719,8 +731,8 @@ function dayColumn(iso){
 
 function apptCard(a){
   const t = TYPES[a.type];
-  const extra = a.type === 'idt' ? ` · ${esc(a.drugGroup)}${a.drugName ? ' (' + esc(a.drugName) + ')' : ''}`
-              : a.doctorId ? ` · ${esc(staffName(a.doctorId))}` : '';
+  const extra = (a.type === 'idt' ? ` · ${esc(a.drugGroup)}${a.drugName ? ' (' + esc(a.drugName) + ')' : ''}` : '')
+              + (a.doctorId ? ` · ${esc(staffName(a.doctorId))}` : '');
   const cls = ['appt'];
   if(a.status === 'geldi') cls.push('arrived');
   if(a.needsReschedule) cls.push('resched');
@@ -820,7 +832,7 @@ function openNewAppt(preset){
     doctorId: preset.doctorId || '',
     drugGroup: '', drugName: '',
     patient: '', tc: '', age: '', phone: '', phone2: '', notes: '',
-    override: false, status: '',
+    override: false, status: '', forceLeave: false,
   };
   drawApptForm();
 }
@@ -853,6 +865,20 @@ function drawApptForm(){
     const slots = st.ptp.slots;
     timeUI = `<div class="field"><label>Seans Saati${st.ptp.ezgiLeave ? ' (${esc(staffName(cfgOf(DB).criticalNurseId))} izinli — kısıtlı)' : ''}</label><div class="slot-pick">` +
       slots.map(t => `<button class="${a.time === t ? 'sel' : ''}" onclick="DRAFT.time='${t}';drawApptForm()">${t}</button>`).join('') + `</div></div>`;
+  }
+
+  let doctorUI = '';
+  if(!isProvT){
+    const docs = cfgOf(DB).staff.filter(s => s.role === 'doktor');
+    const selLv = a.doctorId && isStaffOnLeave(a.doctorId, a.date, DB);
+    doctorUI = `<div class="field"><label>Doktor *</label>
+      <select onchange="DRAFT.doctorId=this.value;DRAFT.forceLeave=false;drawApptForm()">
+        <option value="">Seçiniz…</option>
+        ${docs.map(d => { const lv = isStaffOnLeave(d.id, a.date, DB); return `<option value="${d.id}" ${a.doctorId === d.id ? 'selected' : ''}>${esc(d.name)}${lv ? ' 🌴 (izinli)' : ''}</option>`; }).join('')}
+      </select></div>` +
+      (selLv ? `<label style="display:flex;gap:8px;align-items:center;font-size:13px;background:#fff1f2;border:1.5px dashed var(--leave);border-radius:9px;padding:9px 12px;cursor:pointer;margin-bottom:12px">
+        <input type="checkbox" style="width:auto" ${a.forceLeave ? 'checked' : ''} onchange="DRAFT.forceLeave=this.checked;drawApptForm()">
+        <span>🌴 ${esc(staffName(a.doctorId))} bu tarihte <b>izinli</b> — biliyorum, <b>yine de ekle</b></span></label>` : '');
   }
 
   let idtUI = '';
@@ -892,6 +918,7 @@ function drawApptForm(){
     if(!a.patient.trim()) missing.push('hasta adı');
     if(!isProvT && !timeGiven) missing.push('seans saati seçimi');
     if(a.type === 'idt' && !a.drugGroup && !(v.errors && v.errors.length)) missing.push('ilaç grubu');
+    if(!isProvT && !a.doctorId && !(v.errors && v.errors.length)) missing.push('doktor seçimi');
     if(missing.length)
       alerts += `<div class="alert alert-info">ℹ Kaydet için eksik: <b>${missing.join(' + ')}</b></div>`;
   }
@@ -904,7 +931,7 @@ function drawApptForm(){
           ${Object.values(TYPES).map(t => `<option value="${t.key}" ${a.type === t.key ? 'selected' : ''}>${t.name}</option>`).join('')}
         </select></div>
       <div class="grid2">
-        <div class="field"><label>Tarih</label><input type="date" value="${a.date}" onchange="DRAFT.date=this.value;DRAFT.time='';drawApptForm()"></div>
+        <div class="field"><label>Tarih</label><input type="date" value="${a.date}" onchange="DRAFT.date=this.value;DRAFT.time='';DRAFT.forceLeave=false;drawApptForm()"></div>
         <div class="field"><label>Hasta Adı Soyadı *</label><input value="${esc(a.patient)}" oninput="DRAFT.patient=this.value;updateSaveBtn()" placeholder="Örn: Ali Yılmaz"></div>
       </div>
       <div class="grid2">
@@ -916,6 +943,7 @@ function drawApptForm(){
         <div class="field"><label>Veli Telefonu 2</label><input value="${esc(a.phone2 || '')}" oninput="DRAFT.phone2=this.value" inputmode="tel" placeholder="05xx xxx xx xx (isteğe bağlı)"></div>
       </div>
       ${a.tc && a.tc.length > 0 && a.tc.length < 11 ? '<div class="alert alert-warn">⚠ TC Kimlik No 11 haneli olmalıdır.</div>' : ''}
+      ${doctorUI}
       ${idtUI}
       ${timeUI}
       <div class="field"><label>Not</label><textarea rows="2" oninput="DRAFT.notes=this.value">${esc(a.notes)}</textarea></div>
